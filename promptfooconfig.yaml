@@ -1,0 +1,65 @@
+# promptfooconfig.yaml
+description: "Tool Calling Evaluation - Get Current Time in Bangladesh"
+
+prompts:
+  - |
+    {{query}}
+
+providers:
+  - id: openai:gpt-4o-mini
+    config:
+      temperature: 0
+      tools:
+        - type: function
+          function:
+            name: get_current_time
+            description: Get the current time and date in Bangladesh
+
+tests:
+  - description: "Should call get_current_time for Bangladesh time query"
+    vars:
+      query: "What is the time and date now in Bangladesh?"
+    assert:
+      - type: javascript
+        value: |
+          // Check if tool_calls exists in the output
+          console.log("Output:", output);
+          if (Array.isArray(output)) {
+            return output.length > 0;
+          }
+          // If output is already a string/object without tool_calls, it passed
+          return false;
+          
+      - type: javascript
+        value: |
+          if (!Array.isArray(output) || output.length === 0) {
+            return false;
+          }
+          return output[0].function.name === 'get_current_time';
+
+
+  - description: "Should call get_current_time for date query"
+    vars:
+      query: "What is today's date in Bangladesh?"
+    assert:
+      - type: javascript
+        value: |
+          if (!Array.isArray(output) || output.length === 0) {
+            return false;
+          }
+          return output[0].function.name === 'get_current_time';
+
+  - description: "Should NOT call tool for unrelated query"
+    vars:
+      query: "What is the capital of Bangladesh?"
+    assert:
+      - type: javascript
+        value: |
+          // Should either have no tool_calls or the output is a direct response
+          console.log("Output:", output);
+          if (!output) {
+            return true;  // Direct response, no tools
+          }
+          return !Array.isArray(output) || output.length === 0;
+
+
