@@ -6,19 +6,18 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"os/exec"
 	"time"
 
 	openai "github.com/sashabaranov/go-openai"
 )
 
-func runEvaluation() error {
-	cmd := exec.Command("promptfoo", "eval")
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	fmt.Println("Running Promptfoo evaluation...")
-	return cmd.Run()
-}
+// func runEvaluation() error {
+// 	cmd := exec.Command("promptfoo", "eval")
+// 	cmd.Stdout = os.Stdout
+// 	cmd.Stderr = os.Stderr
+// 	fmt.Println("Running Promptfoo evaluation...")
+// 	return cmd.Run()
+// }
 
 func main() {
 	log.SetFlags(0)
@@ -35,66 +34,44 @@ func main() {
 		},
 	}
 
-	tools := []openai.Tool{
-		{
-			Type: openai.ToolTypeFunction,
-			Function: &openai.FunctionDefinition{
-				Name:        "get_current_time",
-				Description: "Get the current time and date in Bangladesh",
-			},
-		},
-	}
+	// tools := []openai.Tool{
+	// 	{
+	// 		Type: openai.ToolTypeFunction,
+	// 		Function: &openai.FunctionDefinition{
+	// 			Name:        "get_current_time",
+	// 			Description: "Get the current time and date in Bangladesh",
+	// 		},
+	// 	},
+	// }
 
 	// api calls:
-	resp, err := client.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
-		Model:    openai.GPT4oMini,
-		Messages: messages,
-		Tools:    tools,
+	stream, err := client.CreateChatCompletionStream(ctx, openai.ChatCompletionRequest{
+		Model:     openai.GPT4oMini,
+		MaxTokens: 1000,
+		Messages:  messages,
+		// Tools:     tools,
+		Stream: true,
 	})
 	if err != nil {
 		log.Fatalf("ChatCompletion error: %v", err)
 	}
 
-	message := resp.Choices[0].Message
-	messages = append(messages, message)
+	defer stream.Close()
 
-	if len(message.ToolCalls) > 0 {
-		for _, toolCall := range message.ToolCalls {
-			fmt.Printf("Tool Call : %s\n", toolCall.Function.Name)
-
-			var result string
-			if toolCall.Function.Name == "get_current_time" {
-				result = getCurrentDateTime()
-			}
-
-			messages = append(messages, openai.ChatCompletionMessage{
-				Role:       openai.ChatMessageRoleTool,
-				Content:    result,
-				ToolCallID: toolCall.ID,
-			})
-		}
-
-		// MOVE THIS OUTSIDE THE LOOP - only call once after all tools
-		resp, err = client.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
-			Model:    openai.GPT4oMini,
-			Messages: messages,
-			Tools:    tools,
-		})
+	for {
+		response, err := stream.Recv()
 		if err != nil {
-			fmt.Printf("chatCompletionError: %v\n", err)
-			return
+			log.Fatalf("Stream error: %v", err)
 		}
 
-		// Print the final response from tool call
-		fmt.Println("\nAssistant:", resp.Choices[0].Message.Content)
-	} else {
-		// If no tool calls, print the assistant's response directly
-		fmt.Println("\nAssistant:", message.Content)
+		if response.Choices[0].FinishReason != "" {
+			break
+		}
+
+		fmt.Printf("%s", response.Choices[0].Delta.Content)
+
 	}
 
-	if err := runEvaluation(); err != nil {
-		log.Printf("Evaluation failed: %v", err)
-	}
 }
 
 func getCurrentDateTime() string {
