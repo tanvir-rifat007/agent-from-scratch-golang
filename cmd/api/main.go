@@ -19,6 +19,8 @@ import (
 	openai "github.com/sashabaranov/go-openai"
 )
 
+const MAX_TURNS = 10
+
 func main() {
 	log.SetFlags(0)
 
@@ -30,11 +32,10 @@ func main() {
 	client := openai.NewClient(apiKey)
 	ctx := context.Background()
 
-	// Conversation memory
 	messages := []openai.ChatCompletionMessage{
 		{
 			Role:    openai.ChatMessageRoleSystem,
-			Content: "You are a helpful assistant. If user asks for Bangladesh time, use the tool.",
+			Content: "You are a helpful assistant. Use tools whenever relevant.",
 		},
 	}
 
@@ -46,7 +47,6 @@ func main() {
 				Description: "Get the current time and date in Bangladesh",
 			},
 		},
-
 		{
 			Type: openai.ToolTypeFunction,
 			Function: &openai.FunctionDefinition{
@@ -56,8 +56,20 @@ func main() {
 		},
 	}
 
-	reader := bufio.NewReader(os.Stdin)
+	// this is for the promptfoo evaluation
+	if len(os.Args) > 1 {
 
+		userInput := strings.Join(os.Args[1:], " ")
+		messages = append(messages, openai.ChatCompletionMessage{
+			Role:    openai.ChatMessageRoleUser,
+			Content: userInput,
+		})
+		runAgentLoop(ctx, client, &messages, tools)
+		return
+
+	}
+
+	reader := bufio.NewReader(os.Stdin)
 	fmt.Println("Chat started (type 'exit' to quit)\n")
 
 	for {
@@ -70,16 +82,32 @@ func main() {
 			break
 		}
 
-		// Add user message
 		messages = append(messages, openai.ChatCompletionMessage{
 			Role:    openai.ChatMessageRoleUser,
 			Content: userInput,
 		})
 
-		// First stream
+		// this runAgent means: Agent in loop
+		runAgentLoop(ctx, client, &messages, tools)
+		fmt.Println()
+		fmt.Println()
+
+	}
+}
+
+func runAgentLoop(ctx context.Context, client *openai.Client, messages *[]openai.ChatCompletionMessage, tools []openai.Tool) {
+	iteration := 0
+	for {
+
+		if iteration >= MAX_TURNS {
+			fmt.Println("\nMaximum turns reached. Ending chat.")
+			break
+		}
+		iteration++
+
 		stream, err := client.CreateChatCompletionStream(ctx, openai.ChatCompletionRequest{
 			Model:    openai.GPT4oMini,
-			Messages: messages,
+			Messages: *messages,
 			Tools:    tools,
 			Stream:   true,
 		})
@@ -87,114 +115,60 @@ func main() {
 			log.Fatal(err)
 		}
 
-		defer stream.Close()
-
-		// Collect assistant message and tool calls
-		var assistantMessage openai.ChatCompletionMessage
-		assistantMessage.Role = openai.ChatMessageRoleAssistant
+		var assistantMsg openai.ChatCompletionMessage
+		assistantMsg.Role = openai.ChatMessageRoleAssistant
 		toolCalls := make(map[int]*openai.ToolCall)
 
-		fmt.Print("Assistant: ")
-
-		// this loop is for streaming
 		for {
 			response, err := stream.Recv()
 			if err != nil {
 				break
 			}
-
 			delta := response.Choices[0].Delta
-
-			// Stream content
 			if delta.Content != "" {
 				fmt.Print(delta.Content)
-				assistantMessage.Content += delta.Content
+				assistantMsg.Content += delta.Content
 			}
-
-			// Collect tool calls
 			for _, tc := range delta.ToolCalls {
-				fmt.Printf("%+v\n", tc)
 				if _, exists := toolCalls[*tc.Index]; !exists {
 					toolCalls[*tc.Index] = &openai.ToolCall{
-						ID:   tc.ID,
-						Type: tc.Type,
-						Function: openai.FunctionCall{
-							Name:      tc.Function.Name,
-							Arguments: "",
-						},
+						ID:       tc.ID,
+						Type:     tc.Type,
+						Function: openai.FunctionCall{Name: tc.Function.Name},
 					}
 				}
 				toolCalls[*tc.Index].Function.Arguments += tc.Function.Arguments
-
 			}
 		}
+		stream.Close()
 
-		// Attach tool calls if any
-		for _, tc := range toolCalls {
-			assistantMessage.ToolCalls = append(assistantMessage.ToolCalls, *tc)
+		for i := 0; i < len(toolCalls); i++ {
+			if tc, ok := toolCalls[i]; ok {
+				assistantMsg.ToolCalls = append(assistantMsg.ToolCalls, *tc)
+			}
+		}
+		*messages = append(*messages, assistantMsg)
+
+		if len(assistantMsg.ToolCalls) == 0 {
+			break // model is done
 		}
 
-		// Save assistant message
-		messages = append(messages, assistantMessage)
-
-		// HANDLE TOOL CALLS
-		if len(assistantMessage.ToolCalls) > 0 {
-
-			fmt.Println("\n🔧 Executing tool...")
-
-			for _, tc := range assistantMessage.ToolCalls {
-
-				var toolResponse string
-
-				switch tc.Function.Name {
-				case "get_current_time":
-					toolResponse = getCurrentDateTime()
-				case "prime_minister_of_bangladesh":
-					toolResponse = primeMinisterOfBangladesh()
-				default:
-					toolResponse = `{"error": "unknown tool"}`
-				}
-
-				messages = append(messages, openai.ChatCompletionMessage{
-					Role:       openai.ChatMessageRoleTool,
-					Content:    toolResponse,
-					ToolCallID: tc.ID,
-				})
+		for _, tc := range assistantMsg.ToolCalls {
+			var result string
+			switch tc.Function.Name {
+			case "get_current_time":
+				result = getCurrentDateTime()
+			case "prime_minister_of_bangladesh":
+				result = primeMinisterOfBangladesh()
+			default:
+				result = `{"error": "unknown tool"}`
 			}
-
-			// final stream to get assistant's response after tool execution
-
-			finalStream, err := client.CreateChatCompletionStream(ctx, openai.ChatCompletionRequest{
-				Model:    openai.GPT4oMini,
-				Messages: messages,
-				Stream:   true,
+			*messages = append(*messages, openai.ChatCompletionMessage{
+				Role:       openai.ChatMessageRoleTool,
+				Content:    result,
+				ToolCallID: tc.ID,
 			})
-			if err != nil {
-				log.Fatal(err)
-			}
-
-			var finalAssistant openai.ChatCompletionMessage
-			finalAssistant.Role = openai.ChatMessageRoleAssistant
-
-			fmt.Print("Assistant: ")
-
-			for {
-				resp, err := finalStream.Recv()
-				if err != nil {
-					break
-				}
-
-				content := resp.Choices[0].Delta.Content
-				fmt.Print(content)
-				finalAssistant.Content += content
-			}
-
-			finalStream.Close()
-
-			messages = append(messages, finalAssistant)
 		}
-
-		fmt.Println("\n")
 	}
 }
 
@@ -214,10 +188,10 @@ func getCurrentDateTime() string {
 		"timestamp": now.Unix(),
 	}
 
-	resultJSON, _ := json.Marshal(result)
-	return string(resultJSON)
+	data, _ := json.Marshal(result)
+	return string(data)
 }
 
 func primeMinisterOfBangladesh() string {
-	return "Dr. Yunus is the prime minister of Bangladesh."
+	return `{"prime_minister": "Dr. Muhammad Yunus"}`
 }
