@@ -8,18 +8,25 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
 	"os"
 	"strings"
 	"time"
 
 	openai "github.com/sashabaranov/go-openai"
+	"github.com/sashabaranov/go-openai/jsonschema"
 )
 
-const MAX_TURNS = 10
+const (
+	MODEL     = openai.GPT4oMini
+	MAX_TURNS = 10
+)
 
 func main() {
 	log.SetFlags(0)
@@ -32,45 +39,34 @@ func main() {
 	client := openai.NewClient(apiKey)
 	ctx := context.Background()
 
-	messages := []openai.ChatCompletionMessage{
-		{
-			Role:    openai.ChatMessageRoleSystem,
-			Content: "You are a helpful assistant. Use tools whenever relevant.",
-		},
-	}
-
-	tools := []openai.Tool{
-		{
-			Type: openai.ToolTypeFunction,
-			Function: &openai.FunctionDefinition{
-				Name:        "get_current_time",
-				Description: "Get the current time and date in Bangladesh",
-			},
-		},
-		{
-			Type: openai.ToolTypeFunction,
-			Function: &openai.FunctionDefinition{
-				Name:        "prime_minister_of_bangladesh",
-				Description: "Get the name of the current prime minister of Bangladesh",
+	//Initialize long-lived memory
+	mem := &AgentMemory{
+		SystemMessages: []openai.ChatCompletionMessage{
+			{
+				Role:    openai.ChatMessageRoleSystem,
+				Content: "You are a helpful assistant. Use tools whenever relevant.",
 			},
 		},
 	}
 
-	// this is for the promptfoo evaluation
+	tools := buildTools()
+
+	// this is for promptfoo evaluation testing
 	if len(os.Args) > 1 {
 
 		userInput := strings.Join(os.Args[1:], " ")
-		messages = append(messages, openai.ChatCompletionMessage{
+		userMsg := openai.ChatCompletionMessage{
 			Role:    openai.ChatMessageRoleUser,
 			Content: userInput,
-		})
-		runAgentLoop(ctx, client, &messages, tools)
+		}
+
+		runAgentLoop(ctx, client, mem, userMsg, tools, true)
 		return
 
 	}
 
 	reader := bufio.NewReader(os.Stdin)
-	fmt.Println("Chat started (type 'exit' to quit)\n")
+	fmt.Println("Chat started (type 'exit' to quit)")
 
 	for {
 		fmt.Print("You: ")
@@ -82,32 +78,47 @@ func main() {
 			break
 		}
 
-		messages = append(messages, openai.ChatCompletionMessage{
+		userMsg := openai.ChatCompletionMessage{
 			Role:    openai.ChatMessageRoleUser,
 			Content: userInput,
-		})
+		}
 
-		// this runAgent means: Agent in loop
-		runAgentLoop(ctx, client, &messages, tools)
+		runAgentLoop(ctx, client, mem, userMsg, tools, true)
 		fmt.Println()
-		fmt.Println()
-
 	}
 }
 
-func runAgentLoop(ctx context.Context, client *openai.Client, messages *[]openai.ChatCompletionMessage, tools []openai.Tool) {
-	iteration := 0
-	for {
+func runAgentLoop(
+	ctx context.Context,
+	client *openai.Client,
+	mem *AgentMemory,
+	userMsg openai.ChatCompletionMessage,
+	tools []openai.Tool,
+	verbose bool,
+) {
 
+	iteration := 0
+	var turn []openai.ChatCompletionMessage
+	turn = append(turn, userMsg)
+
+	for {
 		if iteration >= MAX_TURNS {
-			fmt.Println("\nMaximum turns reached. Ending chat.")
+			fmt.Println("\nMaximum turns reached.")
 			break
 		}
 		iteration++
 
+		err := CompactIfNeeded(ctx, client, MODEL, mem)
+		if err != nil {
+			log.Println("memory compaction error:", err)
+		}
+
+		sendMessages := BuildContext(mem)
+		sendMessages = append(sendMessages, turn...)
+
 		stream, err := client.CreateChatCompletionStream(ctx, openai.ChatCompletionRequest{
-			Model:    openai.GPT4oMini,
-			Messages: *messages,
+			Model:    MODEL,
+			Messages: sendMessages,
 			Tools:    tools,
 			Stream:   true,
 		})
@@ -121,14 +132,21 @@ func runAgentLoop(ctx context.Context, client *openai.Client, messages *[]openai
 
 		for {
 			response, err := stream.Recv()
-			if err != nil {
+			if err == io.EOF {
 				break
 			}
+			if err != nil {
+				log.Println("stream error:", err)
+				break
+			}
+
 			delta := response.Choices[0].Delta
+
 			if delta.Content != "" {
 				fmt.Print(delta.Content)
 				assistantMsg.Content += delta.Content
 			}
+
 			for _, tc := range delta.ToolCalls {
 				if _, exists := toolCalls[*tc.Index]; !exists {
 					toolCalls[*tc.Index] = &openai.ToolCall{
@@ -147,51 +165,120 @@ func runAgentLoop(ctx context.Context, client *openai.Client, messages *[]openai
 				assistantMsg.ToolCalls = append(assistantMsg.ToolCalls, *tc)
 			}
 		}
-		*messages = append(*messages, assistantMsg)
+
+		turn = append(turn, assistantMsg)
 
 		if len(assistantMsg.ToolCalls) == 0 {
-			break // model is done
+			break
+		}
+
+		if verbose {
+			fmt.Println("\n\n🔧 Tool calls:")
+			for _, tc := range assistantMsg.ToolCalls {
+				fmt.Printf("  - %s(%s)\n", tc.Function.Name, tc.Function.Arguments)
+			}
 		}
 
 		for _, tc := range assistantMsg.ToolCalls {
-			var result string
-			switch tc.Function.Name {
-			case "get_current_time":
-				result = getCurrentDateTime()
-			case "prime_minister_of_bangladesh":
-				result = primeMinisterOfBangladesh()
-			default:
-				result = `{"error": "unknown tool"}`
-			}
-			*messages = append(*messages, openai.ChatCompletionMessage{
+
+			result := executeTool(tc, verbose)
+
+			toolMsg := openai.ChatCompletionMessage{
 				Role:       openai.ChatMessageRoleTool,
 				Content:    result,
 				ToolCallID: tc.ID,
-			})
+			}
+
+			turn = append(turn, toolMsg)
 		}
+	}
+
+	AddTurn(mem, turn)
+}
+
+func buildTools() []openai.Tool {
+	return []openai.Tool{
+		{
+			Type: openai.ToolTypeFunction,
+			Function: &openai.FunctionDefinition{
+				Name:        "get_current_time",
+				Description: "Get current date and time in Bangladesh",
+			},
+		},
+		{
+			Type: openai.ToolTypeFunction,
+			Function: &openai.FunctionDefinition{
+				Name:        "web_search",
+				Description: "Search the web for real-time information",
+				Parameters: jsonschema.Definition{
+					Type: jsonschema.Object,
+					Properties: map[string]jsonschema.Definition{
+						"query": {Type: jsonschema.String},
+					},
+					Required: []string{"query"},
+				},
+			},
+		},
+	}
+}
+
+func executeTool(tc openai.ToolCall, verbose bool) string {
+
+	switch tc.Function.Name {
+
+	case "get_current_time":
+		return getCurrentDateTime()
+
+	case "web_search":
+		var args struct {
+			Query string `json:"query"`
+		}
+		if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
+			return `{"error":"invalid arguments"}`
+		}
+		if verbose {
+			fmt.Printf("\n🌐 Searching: %s\n", args.Query)
+		}
+		return tavilySearch(args.Query)
+
+	default:
+		return `{"error":"unknown tool"}`
 	}
 }
 
 func getCurrentDateTime() string {
-	loc, err := time.LoadLocation("Asia/Dhaka")
-	if err != nil {
-		loc = time.UTC
-	}
-
+	loc, _ := time.LoadLocation("Asia/Dhaka")
 	now := time.Now().In(loc)
-
 	result := map[string]any{
-		"datetime":  now.Format(time.RFC3339),
-		"date":      now.Format("2006-01-02"),
-		"time":      now.Format("15:04:05"),
-		"timezone":  "Asia/Dhaka",
-		"timestamp": now.Unix(),
+		"datetime": now.Format(time.RFC3339),
 	}
-
 	data, _ := json.Marshal(result)
 	return string(data)
 }
 
-func primeMinisterOfBangladesh() string {
-	return `{"prime_minister": "Dr. Muhammad Yunus"}`
+func tavilySearch(query string) string {
+	apiKey := os.Getenv("TAVILY_API_KEY")
+	if apiKey == "" {
+		return `{"error":"TAVILY_API_KEY not set"}`
+	}
+
+	payload, _ := json.Marshal(map[string]any{
+		"api_key":     apiKey,
+		"query":       query,
+		"max_results": 3,
+	})
+
+	resp, err := http.Post("https://api.tavily.com/search", "application/json", bytes.NewBuffer(payload))
+	if err != nil {
+		return `{"error":"search failed"}`
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+
+	if len(body) > 5000 {
+		body = body[:5000]
+	}
+
+	return string(body)
 }
