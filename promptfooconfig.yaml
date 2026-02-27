@@ -24,7 +24,7 @@ tests:
       query: "who is the pm of Bangladesh?"
     assert:
       - type: contains
-        value: "Dr. Muhammad Yunus"
+        value: "Tarique Rahman"
 
   - description: "Should handle unrelated query"
     vars:
@@ -32,3 +32,4 @@ tests:
     assert:
       - type: contains
         value: "Delhi"
+
